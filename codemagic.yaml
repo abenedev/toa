@@ -1,14 +1,51 @@
+# Builds the native iOS app (ios/) and uploads it to TestFlight.
+# No triggering section: builds only start manually from the Codemagic UI, so
+# free-tier minutes are only spent when you decide to test a batch of changes.
 workflows:
-    toa:
-        name: Toa Workflow
-        max_build_duration: 120
-        instance_type: mac_mini_m2
-        scripts:
-          - name: Build
-            script: | 
-              cd frontend
-              npm i
-              npx cap sync ios
-              cd ios/App
-              pod install
-              xcodebuild -workspace App.xcworkspace -scheme App -configuration Release -archivePath build/App.xcarchive archive
+  ios-testflight:
+    name: iOS → TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    integrations:
+      # Name of the App Store Connect API key in Codemagic → Team settings → Integrations
+      app_store_connect: codemagic
+    # Secrets and TOA_* values are set as app-level environment variables in Codemagic
+    # (app settings → Environment variables), since team variable groups need a paid team.
+    # CERTIFICATE_PRIVATE_KEY (secure): lets Codemagic create/reuse the distribution certificate.
+    # TOA_API_BASE_URL, TOA_COGNITO_REGION, TOA_COGNITO_CLIENT_ID stay empty for a guest-only build.
+    environment:
+      groups:
+        - toa-secrets
+      vars:
+        BUNDLE_ID: dev.abene.toa
+        # Numeric Apple ID of the app (App Store Connect → App Information)
+        APP_STORE_APPLE_ID: "6827833689"
+      xcode: latest
+    scripts:
+      - name: Generate Xcode project
+        script: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" 2>/dev/null || echo 0)
+          export TOA_BUILD_NUMBER=$(( ${LATEST:-0} + 1 ))
+          echo "Build number: $TOA_BUILD_NUMBER"
+          # Always defined (possibly empty) so xcodegen never leaves a literal ${VAR}.
+          export TOA_API_BASE_URL="${TOA_API_BASE_URL:-}" TOA_COGNITO_REGION="${TOA_COGNITO_REGION:-}" \
+            TOA_COGNITO_CLIENT_ID="${TOA_COGNITO_CLIENT_ID:-}" TOA_SUBSCRIPTION_PRODUCT_ID="${TOA_SUBSCRIPTION_PRODUCT_ID:-}"
+          cd ios && xcodegen generate
+      - name: Set up code signing
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+          keychain add-certificates
+          xcode-project use-profiles --project ios/Toa.xcodeproj
+      - name: Build ipa
+        script: xcode-project build-ipa --project ios/Toa.xcodeproj --scheme Toa
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        # Internal testers get every processed build without beta review;
+        # set to true (plus beta_groups) only for external testers.
+        submit_to_testflight: false
