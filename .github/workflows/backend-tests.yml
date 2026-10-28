@@ -1,0 +1,40 @@
+name: Backend Tests
+
+on:
+  push:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend-tests.yml"]
+  pull_request:
+    paths: ["backend/**", ".github/workflows/backend-tests.yml"]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: workout_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d workout_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://user:password@localhost:5432/workout_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version-file: backend/.python-version
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - run: uv sync --locked
+      - run: uv run pytest

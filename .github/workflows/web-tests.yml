@@ -1,0 +1,24 @@
+name: Web Tests
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/web-tests.yml"]
+  pull_request:
+    paths: ["web/**", ".github/workflows/web-tests.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
