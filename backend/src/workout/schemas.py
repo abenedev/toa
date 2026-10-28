@@ -1,353 +1,125 @@
-from datetime import datetime
-from enum import Enum
+import uuid
+from datetime import UTC, datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class SetType(str, Enum):
-    WARMUP = "WARMUP"
-    WORKSET = "WORKSET"
-    DROPSET = "DROPSET"
-    SUPERSET = "SUPERSET"
-    FAILURE = "FAILURE"
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, PlainSerializer
 
 
-class ExerciseType(str, Enum):
-    REPS = "REPS"
-    DURATION = "DURATION"
+def _to_utc_ms(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    value = value.astimezone(UTC)
+    return value.replace(microsecond=value.microsecond // 1000 * 1000)
 
 
-class Equipment(str, Enum):
-    BARBELL = "BARBELL"
-    DUMBBELL = "DUMBBELL"
-    MACHINE = "MACHINE"
-    BODYWEIGHT = "BODYWEIGHT"
-    ASSISTED_BODYWEIGHT = "ASSISTED_BODYWEIGHT"
+def _format_utc_ms(value: datetime) -> str:
+    return _to_utc_ms(value).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-# --- User Schemas ---
+# ISO-8601 UTC, millisecond precision, `Z` suffix (e.g. 2026-10-26T12:00:00.123Z).
+# Accepts any ISO-8601 input (with or without fractional seconds / offset).
+UtcDatetime = Annotated[
+    datetime,
+    AfterValidator(_to_utc_ms),
+    PlainSerializer(_format_utc_ms, return_type=str, when_used="json"),
+]
+
+Int32 = Annotated[int, Field(ge=-(2**31), le=2**31 - 1)]
+
+ExerciseType = Literal["REPS", "DURATION"]
+Equipment = Literal[
+    "BARBELL", "DUMBBELL", "MACHINE", "BODYWEIGHT", "ASSISTED_BODYWEIGHT"
+]
+SetType = Literal["WORKSET", "WARMUP", "DROPSET", "SUPERSET", "FAILURE"]
+EntityName = Literal["exercises", "workouts", "workout_exercises", "sets"]
 
 
-class UserBase(BaseModel):
-    email: str = Field(..., max_length=255)
-    bodyweight: float | None = None
-
-
-class UserCreate(UserBase):
-    password: str = Field(..., max_length=255)
-
-
-class UserUpdate(BaseModel):
-    email: str | None = Field(default=None, max_length=255)
-    password: str | None = Field(default=None, max_length=255)
-    bodyweight: float | None = None
-
-
-class UserRead(UserBase):
-    id: int
-
+class Row(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+    id: uuid.UUID
+    updated_at: UtcDatetime
 
 
-class TokenData(BaseModel):
-    user_id: int | None = None
-
-
-class LoginRequest(BaseModel):
-    email: str = Field(..., max_length=255)
-    password: str = Field(..., max_length=255)
-
-
-# --- Macrocycle Schemas ---
-
-
-class MacrocycleBase(BaseModel):
-    name: str = Field(..., max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-    nb_mesocycles: int | None = None
-
-
-class MacrocycleCreate(MacrocycleBase):
-    user_id: int
-
-
-class MacrocycleUpdate(BaseModel):
-    name: str | None = Field(default=None, max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-    nb_mesocycles: int | None = None
-
-
-class MacrocycleRead(MacrocycleBase):
-    id: int
-    user_id: int
-    creation_date: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- Mesocycle Schemas ---
-
-
-class MesocycleBase(BaseModel):
-    name: str = Field(..., max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-
-
-class MesocycleCreate(MesocycleBase):
-    macrocycle_id: int
-
-
-class MesocycleUpdate(BaseModel):
-    name: str | None = Field(default=None, max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-    macrocycle_id: int | None = None
-
-
-class MesocycleRead(MesocycleBase):
-    id: int
-    macrocycle_id: int
-    creation_date: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- Workout Schemas ---
-
-
-class WorkoutBase(BaseModel):
-    name: str = Field(..., max_length=255)
-    planned: bool = True
-    description: str | None = Field(default=None, max_length=1024)
-    note: str | None = Field(default=None, max_length=2048)
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-
-
-class WorkoutCreate(WorkoutBase):
-    user_id: int
-    mesocycle_id: int | None = None
-    source_workout_id: int | None = None
-
-
-class WorkoutUpdate(BaseModel):
-    name: str | None = Field(default=None, max_length=255)
-    planned: bool | None = None
-    description: str | None = Field(default=None, max_length=1024)
-    note: str | None = Field(default=None, max_length=2048)
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-    mesocycle_id: int | None = None
-    source_workout_id: int | None = None
-
-
-class WorkoutRead(WorkoutBase):
-    id: int
-    user_id: int
-    mesocycle_id: int | None = None
-    source_workout_id: int | None = None
-    creation_date: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class WorkoutVolumeRead(BaseModel):
-    workout_id: int
-    total_volume: float
-
-
-# --- Exercise Schemas ---
-
-
-class ExerciseBase(BaseModel):
-    name: str = Field(..., max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-    type: ExerciseType = ExerciseType.REPS
+class ExerciseRow(Row):
+    name: str
+    description: str | None = None
+    type: ExerciseType
     equipment: Equipment
 
 
-class ExerciseCreate(ExerciseBase):
-    user_id: int
+class WorkoutRow(Row):
+    name: str
+    planned: bool
+    description: str | None = None
+    note: str | None = None
+    rpe: float | None = None
+    created_at: UtcDatetime
+    source_workout_id: uuid.UUID | None = None
 
 
-class ExerciseUpdate(BaseModel):
-    name: str | None = Field(default=None, max_length=255)
-    description: str | None = Field(default=None, max_length=1024)
-    type: ExerciseType | None = None
-    equipment: Equipment | None = None
+class WorkoutExerciseRow(Row):
+    workout_id: uuid.UUID
+    exercise_id: uuid.UUID
+    position: Int32
+    note: str | None = None
 
 
-class ExerciseRead(ExerciseBase):
-    id: int
-    user_id: int
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- WorkoutExercise Schemas ---
-
-
-class WorkoutExerciseBase(BaseModel):
-    position: int = 0
-    note: str | None = Field(default=None, max_length=1024)
-
-
-class WorkoutExerciseCreate(WorkoutExerciseBase):
-    workout_id: int
-    exercise_id: int
-
-
-class WorkoutExerciseUpdate(BaseModel):
-    position: int | None = None
-    note: str | None = Field(default=None, max_length=1024)
-
-
-class WorkoutExerciseRead(WorkoutExerciseBase):
-    id: int
-    workout_id: int
-    exercise_id: int
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- Set Schemas ---
-
-
-class SetBase(BaseModel):
-    position: int = 0
-    type_: SetType = SetType.WORKSET
-    weight: float | None = None
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-    rest: int = 0
-
-
-class SetCreate(SetBase):
-    workout_id: int
-    exercise_id: int
-
-
-class SetUpdate(BaseModel):
-    position: int | None = None
-    type_: SetType | None = None
-    weight: float | None = None
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-    rest: int | None = None
-    workout_id: int | None = None
-    exercise_id: int | None = None
-
-
-class SetRead(SetBase):
-    id: int
-    workout_id: int
-    exercise_id: int
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- RepSet Schemas ---
-
-
-class RepSetBase(SetBase):
-    reps: int | None = None
-
-
-class RepSetCreate(RepSetBase):
-    workout_id: int
-    exercise_id: int
-
-
-class RepSetUpdate(BaseModel):
-    position: int | None = None
-    type_: SetType | None = None
-    weight: float | None = None
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-    rest: int | None = None
-    workout_id: int | None = None
-    exercise_id: int | None = None
-    reps: int | None = None
-
-
-class RepSetRead(BaseModel):
-    id: int
-    set_id: int
-    type_: str | None = None
+class SetRow(Row):
+    workout_id: uuid.UUID
+    exercise_id: uuid.UUID
+    position: Int32
+    type: SetType
     weight: float | None = None
     rpe: float | None = None
-    rest: int | None = None
-    workout_id: int | None = None
-    exercise_id: int | None = None
-    position: int = 0
-    reps: int | None = None
+    rest: Int32
+    reps: Int32 | None = None
+    duration: Int32 | None = None
 
+
+class DeletedRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-
-# --- DurationSet Schemas ---
-
-
-class DurationSetBase(SetBase):
-    duration: int = 0
+    entity: EntityName
+    id: uuid.UUID
 
 
-class DurationSetCreate(DurationSetBase):
-    workout_id: int
-    exercise_id: int
+class ProfileIn(BaseModel):
+    bodyweight: float | None = None
+    updated_at: UtcDatetime
 
 
-class DurationSetUpdate(BaseModel):
-    position: int | None = None
-    type_: SetType | None = None
-    weight: float | None = None
-    rpe: float | None = Field(default=None, ge=1.0, le=10.0)
-    rest: int | None = None
-    workout_id: int | None = None
-    exercise_id: int | None = None
-    duration: int | None = None
+class Profile(BaseModel):
+    email: str | None
+    bodyweight: float | None
+    updated_at: UtcDatetime | None
+    is_subscribed: bool
 
 
-class DurationSetRead(BaseModel):
-    id: int
-    set_id: int
-    type_: str | None = None
-    weight: float | None = None
-    rpe: float | None = None
-    rest: int | None = None
-    workout_id: int | None = None
-    exercise_id: int | None = None
-    position: int = 0
-    duration: int = 0
-
-    model_config = ConfigDict(from_attributes=True)
+class SyncRequest(BaseModel):
+    cursor: int = Field(0, ge=0)
+    profile: ProfileIn | None = None
+    exercises: list[ExerciseRow] = []
+    workouts: list[WorkoutRow] = []
+    workout_exercises: list[WorkoutExerciseRow] = []
+    sets: list[SetRow] = []
+    deleted: list[DeletedRow] = []
 
 
-# --- Personal Records (PR) Schemas ---
+class SyncResponse(BaseModel):
+    cursor: int
+    profile: Profile
+    exercises: list[ExerciseRow]
+    workouts: list[WorkoutRow]
+    workout_exercises: list[WorkoutExerciseRow]
+    sets: list[SetRow]
+    deleted: list[DeletedRow]
 
 
-class PersonalRecordRead(BaseModel):
-    type: str
-    label: str
-    value: float
-    unit: str
-    date: datetime | None = None
-    detail: str | None = None
-
-
-class RepsAtWeightRead(BaseModel):
-    weight: float
-    reps: int
-    date: datetime | None = None
-
-
-class DurationAtWeightRead(BaseModel):
-    weight: float
-    duration: int
-    date: datetime | None = None
-
-
-class ExercisePRsRead(BaseModel):
-    exercise_id: int
-    records: list[PersonalRecordRead]
-    reps_per_weight: list[RepsAtWeightRead]
-    duration_per_weight: list[DurationAtWeightRead] = Field(default_factory=list)
+def profile_of(user) -> Profile:
+    return Profile(
+        email=user.email,
+        bodyweight=user.bodyweight,
+        updated_at=user.bodyweight_updated_at,
+        is_subscribed=user.is_subscribed,
+    )

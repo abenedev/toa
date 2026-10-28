@@ -1,266 +1,162 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
-    String,
-    UniqueConstraint,
+    Sequence,
+    Text,
+    Uuid,
+    func,
 )
-from sqlalchemy.orm import relationship
 
 from .database import Base
+
+# Global, monotonically increasing change counter. Every synced row and
+# tombstone gets a fresh value when written; clients pull `version > cursor`.
+sync_version = Sequence("sync_version", metadata=Base.metadata)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-    password = Column(String(255), nullable=False)
+    # Cognito `sub`
+    id = Column(Text, primary_key=True)
+    email = Column(Text, nullable=True)
     bodyweight = Column(Float, nullable=True)
+    bodyweight_updated_at = Column(DateTime(timezone=True), nullable=True)
 
-    macrocycles = relationship(
-        "Macrocycle", back_populates="user", cascade="all, delete-orphan"
-    )
-    workouts = relationship(
-        "Workout", back_populates="user", cascade="all, delete-orphan"
-    )
-    exercises = relationship(
-        "Exercise", back_populates="user", cascade="all, delete-orphan"
-    )
+    # Stripe (web)
+    stripe_customer_id = Column(Text, unique=True, nullable=True)
+    subscription_status = Column(Text, nullable=True)
+    subscription_current_period_end = Column(DateTime(timezone=True), nullable=True)
 
+    # Apple App Store (iOS)
+    apple_original_transaction_id = Column(Text, unique=True, nullable=True)
+    apple_expires_at = Column(DateTime(timezone=True), nullable=True)
 
-class Macrocycle(Base):
-    __tablename__ = "macrocycles"
+    @property
+    def is_stripe_subscribed(self) -> bool:
+        if self.subscription_status not in ("active", "trialing"):
+            return False
+        end = _aware(self.subscription_current_period_end)
+        return end is None or end > datetime.now(UTC)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    name = Column(String(255), nullable=False)
-    description = Column(String(1024), nullable=True)
-    creation_date = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    nb_mesocycles = Column(Integer, nullable=True)
+    @property
+    def is_apple_subscribed(self) -> bool:
+        end = _aware(self.apple_expires_at)
+        return end is not None and end > datetime.now(UTC)
 
-    user = relationship("User", back_populates="macrocycles")
-    mesocycles = relationship(
-        "Mesocycle", back_populates="macrocycle", cascade="all, delete-orphan"
-    )
+    @property
+    def is_subscribed(self) -> bool:
+        return self.is_stripe_subscribed or self.is_apple_subscribed
 
 
-class Mesocycle(Base):
-    __tablename__ = "mesocycles"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255), nullable=False)
-    description = Column(String(1024), nullable=True)
-    creation_date = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    macrocycle_id = Column(
-        Integer, ForeignKey("macrocycles.id", ondelete="CASCADE"), nullable=False
-    )
-
-    macrocycle = relationship("Macrocycle", back_populates="mesocycles")
-    workouts = relationship(
-        "Workout", back_populates="mesocycle", cascade="all, delete-orphan"
-    )
+def _user_fk(nullable: bool = False) -> Column:
+    return Column(Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=nullable)
 
 
-class Workout(Base):
-    __tablename__ = "workouts"
+def _updated_at() -> Column:
+    return Column(DateTime(timezone=True), nullable=False)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    planned = Column(Boolean, nullable=False, default=True)
-    name = Column(String(255), nullable=False)
-    description = Column(String(1024), nullable=True)
-    note = Column(String(2048), nullable=True)
-    rpe = Column(Float, nullable=True)
-    creation_date = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
-    mesocycle_id = Column(
-        Integer, ForeignKey("mesocycles.id", ondelete="SET NULL"), nullable=True
-    )
-    source_workout_id = Column(
-        Integer, ForeignKey("workouts.id", ondelete="SET NULL"), nullable=True
-    )
 
-    user = relationship("User", back_populates="workouts")
-    mesocycle = relationship("Mesocycle", back_populates="workouts")
-    source_workout = relationship(
-        "Workout",
-        remote_side=[id],
-        back_populates="derived_workouts",
-        foreign_keys=[source_workout_id],
-    )
-    derived_workouts = relationship("Workout", back_populates="source_workout")
-    sets = relationship("Set", back_populates="workout", cascade="all, delete-orphan")
-    workout_exercises = relationship(
-        "WorkoutExercise", back_populates="workout", cascade="all, delete-orphan"
-    )
+def _version() -> Column:
+    return Column(BigInteger, nullable=False, server_default=sync_version.next_value())
 
 
 class Exercise(Base):
     __tablename__ = "exercises"
-    __table_args__ = (
-        UniqueConstraint("name", "user_id", name="uq_exercise_name_per_user"),
-    )
+    __table_args__ = (Index("ix_exercises_user_version", "user_id", "version"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    name = Column(String(255), nullable=False)
-    description = Column(String(1024), nullable=True)
-    type = Column(String(20), nullable=False, default="REPS")
-    equipment = Column(String(50), nullable=False)
+    id = Column(Uuid, primary_key=True)
+    # NULL user_id means a default exercise shared by every user (read-only)
+    user_id = _user_fk(nullable=True)
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    type = Column(Text, nullable=False)
+    equipment = Column(Text, nullable=False)
+    updated_at = _updated_at()
+    version = _version()
 
-    user = relationship("User", back_populates="exercises")
-    sets = relationship("Set", back_populates="exercise", cascade="all, delete-orphan")
-    workout_exercises = relationship(
-        "WorkoutExercise", back_populates="exercise", cascade="all, delete-orphan"
-    )
+
+class Workout(Base):
+    __tablename__ = "workouts"
+    __table_args__ = (Index("ix_workouts_user_version", "user_id", "version"),)
+
+    id = Column(Uuid, primary_key=True)
+    user_id = _user_fk()
+    name = Column(Text, nullable=False)
+    planned = Column(Boolean, nullable=False)
+    description = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    rpe = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    # Lineage only (the workout this one was started from), not a foreign key
+    source_workout_id = Column(Uuid, nullable=True)
+    updated_at = _updated_at()
+    version = _version()
 
 
 class WorkoutExercise(Base):
     __tablename__ = "workout_exercises"
-    __table_args__ = (
-        UniqueConstraint(
-            "workout_id",
-            "exercise_id",
-            "position",
-            name="uq_workout_exercise_position",
-        ),
-    )
+    __table_args__ = (Index("ix_workout_exercises_user_version", "user_id", "version"),)
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Uuid, primary_key=True)
+    user_id = _user_fk()
     workout_id = Column(
-        Integer, ForeignKey("workouts.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("workouts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     exercise_id = Column(
-        Integer, ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    position = Column(Integer, nullable=False, default=0)
-    note = Column(String(1024), nullable=True)
-
-    workout = relationship("Workout", back_populates="workout_exercises")
-    exercise = relationship("Exercise", back_populates="workout_exercises")
+    position = Column(Integer, nullable=False)
+    note = Column(Text, nullable=True)
+    updated_at = _updated_at()
+    version = _version()
 
 
 class Set(Base):
     __tablename__ = "sets"
+    __table_args__ = (Index("ix_sets_user_version", "user_id", "version"),)
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Uuid, primary_key=True)
+    user_id = _user_fk()
     workout_id = Column(
-        Integer, ForeignKey("workouts.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("workouts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     exercise_id = Column(
-        Integer, ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False
+        Uuid, ForeignKey("exercises.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    position = Column(Integer, nullable=False, default=0)
-    type_ = Column(String(20), nullable=False, default="WORKSET")
+    position = Column(Integer, nullable=False)
+    type = Column(Text, nullable=False)
     weight = Column(Float, nullable=True)
     rpe = Column(Float, nullable=True)
-    rest = Column(Integer, nullable=False, default=0)
-
-    workout = relationship("Workout", back_populates="sets")
-    exercise = relationship("Exercise", back_populates="sets")
-    rep_set = relationship(
-        "RepSet", back_populates="set_", uselist=False, cascade="all, delete-orphan"
-    )
-    duration_set = relationship(
-        "DurationSet",
-        back_populates="set_",
-        uselist=False,
-        cascade="all, delete-orphan",
-    )
-
-
-class RepSet(Base):
-    __tablename__ = "rep_sets"
-
-    id = Column(Integer, primary_key=True, index=True)
-    set_id = Column(
-        Integer,
-        ForeignKey("sets.id", ondelete="CASCADE"),
-        unique=True,
-        nullable=False,
-    )
+    rest = Column(Integer, nullable=False)
     reps = Column(Integer, nullable=True)
-
-    set_ = relationship("Set", back_populates="rep_set")
-
-    @property
-    def type_(self) -> str | None:
-        return self.set_.type_ if self.set_ else None
-
-    @property
-    def rpe(self) -> float | None:
-        return self.set_.rpe if self.set_ else None
-
-    @property
-    def weight(self) -> float | None:
-        return self.set_.weight if self.set_ else None
-
-    @property
-    def rest(self) -> int | None:
-        return self.set_.rest if self.set_ else None
-
-    @property
-    def position(self) -> int | None:
-        return self.set_.position if self.set_ else None
-
-    @property
-    def exercise_id(self) -> int | None:
-        return self.set_.exercise_id if self.set_ else None
-
-    @property
-    def workout_id(self) -> int | None:
-        return self.set_.workout_id if self.set_ else None
+    duration = Column(Integer, nullable=True)
+    updated_at = _updated_at()
+    version = _version()
 
 
-class DurationSet(Base):
-    __tablename__ = "duration_sets"
+class Tombstone(Base):
+    __tablename__ = "tombstones"
+    __table_args__ = (Index("ix_tombstones_user_version", "user_id", "version"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    set_id = Column(
-        Integer,
-        ForeignKey("sets.id", ondelete="CASCADE"),
-        unique=True,
-        nullable=False,
+    entity = Column(Text, primary_key=True)
+    id = Column(Uuid, primary_key=True)
+    user_id = _user_fk()
+    version = _version()
+    deleted_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    duration = Column(Integer, nullable=False, default=0)
-
-    set_ = relationship("Set", back_populates="duration_set")
-
-    @property
-    def type_(self) -> str | None:
-        return self.set_.type_ if self.set_ else None
-
-    @property
-    def rpe(self) -> float | None:
-        return self.set_.rpe if self.set_ else None
-
-    @property
-    def weight(self) -> float | None:
-        return self.set_.weight if self.set_ else None
-
-    @property
-    def rest(self) -> int | None:
-        return self.set_.rest if self.set_ else None
-
-    @property
-    def position(self) -> int | None:
-        return self.set_.position if self.set_ else None
-
-    @property
-    def exercise_id(self) -> int | None:
-        return self.set_.exercise_id if self.set_ else None
-
-    @property
-    def workout_id(self) -> int | None:
-        return self.set_.workout_id if self.set_ else None
