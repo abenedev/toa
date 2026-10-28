@@ -4,12 +4,13 @@ version = "0.1.0"
 description = "Workout API"
 requires-python = ">=3.13"
 dependencies = [
+    "app-store-server-library>=3.1.2",
     "fastapi[standard]>=0.141.1",
     "psycopg2-binary>=2.9.12",
+    "pyjwt[crypto]>=2.15.1",
     "ruff>=0.16.3",
     "sqlalchemy>=2.0.52",
-    "bcrypt>=4.0.0",
-    "python-jose[cryptography]>=3.3.0",
+    "stripe>=16.0.0",
 ]
 
 [tool.pytest.ini_options]

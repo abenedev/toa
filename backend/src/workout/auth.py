@@ -1,74 +1,152 @@
-from datetime import UTC, datetime, timedelta
-from typing import Annotated
+"""Cognito ID token verification and the current-user dependency."""
 
-import bcrypt
+import json
+import os
+import threading
+import time
+import urllib.request
+from typing import Annotated, Any
+
+import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from . import crud
 from .database import get_db
 from .models import User
 
-# Security configuration
-SECRET_KEY = "your-secret-key-change-this-in-production"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+bearer = HTTPBearer(auto_error=False)
 
 DbSession = Annotated[Session, Depends(get_db)]
 
+# Don't hit Cognito more than once per this many seconds for unknown `kid`s.
+JWKS_MIN_REFRESH_SECONDS = 60
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(
-        plain_password.encode("utf-8"), hashed_password.encode("utf-8")
-    )
-
-
-def get_password_hash(password: str) -> str:
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+_jwks_lock = threading.Lock()
+_jwks_keys: dict[str, jwt.PyJWK] = {}
+_jwks_fetched_at: float | None = None
 
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(tz=UTC) + expires_delta
-    else:
-        expire = datetime.now(tz=UTC) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+class InvalidToken(Exception):
+    pass
+
+
+def _config() -> tuple[str, str]:
+    region = os.getenv("COGNITO_REGION")
+    pool_id = os.getenv("COGNITO_USER_POOL_ID")
+    client_id = os.getenv("COGNITO_APP_CLIENT_ID")
+    if not (region and pool_id and client_id):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is not configured",
+        )
+    return f"https://cognito-idp.{region}.amazonaws.com/{pool_id}", client_id
+
+
+def fetch_jwks(issuer: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"{issuer}/.well-known/jwks.json", timeout=5) as r:
+        return json.load(r)
+
+
+def clear_jwks_cache() -> None:
+    global _jwks_fetched_at
+    with _jwks_lock:
+        _jwks_keys.clear()
+        _jwks_fetched_at = None
+
+
+def _signing_key(issuer: str, kid: str) -> jwt.PyJWK:
+    """Cached JWKS lookup; refetches once when the `kid` is unknown."""
+    global _jwks_fetched_at
+    with _jwks_lock:
+        key = _jwks_keys.get(kid)
+        if key is not None:
+            return key
+        now = time.monotonic()
+        if (
+            _jwks_fetched_at is None
+            or now - _jwks_fetched_at >= JWKS_MIN_REFRESH_SECONDS
+        ):
+            try:
+                keys = fetch_jwks(issuer)["keys"]
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Could not fetch signing keys",
+                ) from exc
+            _jwks_keys.clear()
+            for jwk in keys:
+                if jwk.get("kid") and jwk.get("kty") == "RSA":
+                    _jwks_keys[jwk["kid"]] = jwt.PyJWK(jwk)
+            _jwks_fetched_at = now
+        key = _jwks_keys.get(kid)
+        if key is None:
+            raise InvalidToken("Unknown signing key")
+        return key
+
+
+def verify_id_token(token: str) -> dict[str, Any]:
+    """Return the claims of a valid Cognito ID token, else raise InvalidToken."""
+    issuer, client_id = _config()
+    try:
+        kid = jwt.get_unverified_header(token).get("kid")
+        if not kid:
+            raise InvalidToken("Missing kid")
+        claims = jwt.decode(
+            token,
+            _signing_key(issuer, kid).key,
+            algorithms=["RS256"],
+            audience=client_id,
+            issuer=issuer,
+            options={"require": ["exp", "iat", "iss", "aud", "sub", "token_use"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise InvalidToken(str(exc)) from exc
+    if claims.get("token_use") != "id":
+        raise InvalidToken("Not an ID token")
+    return claims
+
+
+def get_claims(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+) -> dict[str, Any]:
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return verify_id_token(credentials.credentials)
+    except InvalidToken:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def get_current_user(
-    token: Annotated[str, Depends(oauth2_scheme)], db: DbSession
+    claims: Annotated[dict[str, Any], Depends(get_claims)], db: DbSession
 ) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = crud.get_user(db, user_id)
+    """The user identified by the token, created on first request."""
+    user_id = str(claims["sub"])
+    email = claims.get("email")
+    user = db.scalar(select(User).where(User.id == user_id))
     if user is None:
-        raise credentials_exception
+        db.execute(
+            insert(User)
+            .values(id=user_id, email=email)
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        db.commit()
+        user = db.scalar(select(User).where(User.id == user_id))
+    if email is not None and user.email != email:
+        user.email = email
+        db.commit()
     return user
 
 
-def authenticate_user(db: Session, email: str, password: str) -> User | None:
-    user = crud.get_user_by_email(db, email)
-    if not user:
-        return None
-    if not verify_password(password, user.password):
-        return None
-    return user
+CurrentUser = Annotated[User, Depends(get_current_user)]
